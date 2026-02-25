@@ -3,10 +3,13 @@ using SqlAgent.Domain.Entities;
 
 namespace SqlAgent.Infrastructure.Data;
 
+/// <summary>
+/// Contexto de base de datos para el catálogo de metadatos del agente.
+/// </summary>
 public class CatalogDbContext : DbContext
 {
     public DbSet<Profile> Profiles => Set<Profile>();
-    public DbSet<ProfileVersion> Versions => Set<ProfileVersion>(); // <--- Actualizado
+    public DbSet<ProfileVersion> Versions => Set<ProfileVersion>();
     public DbSet<DataSource> DataSources => Set<DataSource>();
     public DbSet<Entity> Entities => Set<Entity>();
     public DbSet<Field> Fields => Set<Field>();
@@ -23,76 +26,71 @@ public class CatalogDbContext : DbContext
     {
         base.OnModelCreating(modelBuilder);
 
-        // Profile
+        // Configuración de Profile
         modelBuilder.Entity<Profile>(b =>
         {
             b.HasKey(p => p.Id);
             b.Property(p => p.Name).IsRequired().HasMaxLength(100);
             b.Property(p => p.TenantId).IsRequired().HasMaxLength(50);
-            // Referencia actualizada a ProfileVersion
-            b.HasMany(p => p.Versions).WithOne(v => v.Profile).HasForeignKey(v => v.ProfileId).OnDelete(DeleteBehavior.Cascade);
         });
 
-        // ProfileVersion
+        // Configuración de ProfileVersion
         modelBuilder.Entity<ProfileVersion>(b =>
         {
             b.HasKey(v => v.Id);
             b.Property(v => v.VersionName).IsRequired().HasMaxLength(50);
             b.Property(v => v.Status).IsRequired().HasMaxLength(20);
-            b.HasOne(v => v.DataSource).WithOne(d => d.Version).HasForeignKey<DataSource>(d => d.VersionId).OnDelete(DeleteBehavior.Cascade);
-            b.HasMany(v => v.Entities).WithOne(e => e.Version).HasForeignKey(e => e.VersionId).OnDelete(DeleteBehavior.Cascade);
-            b.HasMany(v => v.Relationships).WithOne(r => r.Version).HasForeignKey(r => r.VersionId).OnDelete(DeleteBehavior.Cascade);
-            b.HasMany(v => v.Metrics).WithOne(m => m.Version).HasForeignKey(m => m.VersionId).OnDelete(DeleteBehavior.Cascade);
-            b.HasMany(v => v.Policies).WithOne(p => p.Version).HasForeignKey(p => p.VersionId).OnDelete(DeleteBehavior.Cascade);
+            b.HasOne(v => v.Profile).WithMany(p => p.Versions).HasForeignKey(v => v.ProfileId);
         });
 
-        // DataSource
+        // Configuración de DataSource
         modelBuilder.Entity<DataSource>(b =>
         {
             b.HasKey(d => d.Id);
-            b.Property(d => d.ConnectionStringName).IsRequired().HasMaxLength(200);
-            b.Property(d => d.Engine).IsRequired().HasMaxLength(50);
+            b.Property(d => d.ConnectionStringName).IsRequired().HasMaxLength(100);
+            b.Property(d => d.Engine).IsRequired().HasMaxLength(20);
+            b.HasOne(d => d.Version).WithOne(v => v.DataSource).HasForeignKey<DataSource>(d => d.VersionId);
         });
 
-        // Entity
+        // Configuración de Entity (Actualizado v3.0)
         modelBuilder.Entity<Entity>(b =>
         {
             b.HasKey(e => e.Id);
             b.Property(e => e.LogicalName).IsRequired().HasMaxLength(100);
             b.Property(e => e.PhysicalName).IsRequired().HasMaxLength(100);
+            b.Property(e => e.Alias).HasMaxLength(10);
+            b.Property(e => e.Category).HasMaxLength(20);
+            b.Property(e => e.DefaultGrainFields).HasMaxLength(200);
+
             b.HasIndex(e => new { e.VersionId, e.LogicalName }).IsUnique();
-            b.HasMany(e => e.Fields).WithOne(f => f.Entity).HasForeignKey(f => f.EntityId).OnDelete(DeleteBehavior.Cascade);
+            b.HasOne(e => e.Version).WithMany(v => v.Entities).HasForeignKey(e => e.VersionId);
         });
 
-        // Field
+        // Configuración de Field
         modelBuilder.Entity<Field>(b =>
         {
             b.HasKey(f => f.Id);
             b.Property(f => f.LogicalName).IsRequired().HasMaxLength(100);
             b.Property(f => f.PhysicalName).IsRequired().HasMaxLength(100);
-            b.Property(f => f.DataType).IsRequired().HasMaxLength(50);
-            b.HasIndex(f => new { f.EntityId, f.LogicalName }).IsUnique();
-            b.HasMany(f => f.Synonyms).WithOne(s => s.Field).HasForeignKey(s => s.FieldId).OnDelete(DeleteBehavior.Cascade);
+            b.Property(f => f.DataType).HasMaxLength(50);
+            b.HasOne(f => f.Entity).WithMany(e => e.Fields).HasForeignKey(f => f.EntityId);
         });
 
-        // Synonym
-        modelBuilder.Entity<Synonym>(b =>
-        {
-            b.HasKey(s => s.Id);
-            b.Property(s => s.Term).IsRequired().HasMaxLength(100);
-            b.HasIndex(s => s.Term);
-        });
-
-        // Relationship
+        // Configuración de Relationship (Actualizado v3.0)
         modelBuilder.Entity<Relationship>(b =>
         {
             b.HasKey(r => r.Id);
-            b.Property(r => r.SourceLogicalName).IsRequired().HasMaxLength(100);
-            b.Property(r => r.TargetLogicalName).IsRequired().HasMaxLength(100);
+            b.Property(r => r.FromEntityLogical).IsRequired().HasMaxLength(100);
+            b.Property(r => r.FromFieldLogical).IsRequired().HasMaxLength(100);
+            b.Property(r => r.ToEntityLogical).IsRequired().HasMaxLength(100);
+            b.Property(r => r.ToFieldLogical).IsRequired().HasMaxLength(100);
             b.Property(r => r.JoinCondition).IsRequired();
+            b.Property(r => r.JoinType).HasMaxLength(20);
+
+            b.HasOne(r => r.Version).WithMany(v => v.Relationships).HasForeignKey(r => r.VersionId);
         });
 
-        // Metric
+        // Configuración de Metric
         modelBuilder.Entity<Metric>(b =>
         {
             b.HasKey(m => m.Id);
@@ -100,12 +98,19 @@ public class CatalogDbContext : DbContext
             b.Property(m => m.Formula).IsRequired();
         });
 
-        // Policy
+        // Configuración de Policy
         modelBuilder.Entity<Policy>(b =>
         {
             b.HasKey(p => p.Id);
             b.Property(p => p.Name).IsRequired().HasMaxLength(100);
             b.Property(p => p.RuleDefinition).IsRequired();
+        });
+
+        // Configuración de Synonym
+        modelBuilder.Entity<Synonym>(b =>
+        {
+            b.HasKey(s => s.Id);
+            b.Property(s => s.Term).IsRequired().HasMaxLength(100);
         });
     }
 }

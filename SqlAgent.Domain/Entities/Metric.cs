@@ -8,8 +8,8 @@ namespace SqlAgent.Domain.Entities
     {
         public Guid Id { get; set; }
         public Guid VersionId { get; set; }
-        public string Name { get; set; } = null!;
-        public string Formula { get; set; } = null!;
+        public string Name { get; set; } = string.Empty;
+        public string Formula { get; set; } = string.Empty;
 
         public ProfileVersion Version { get; set; } = null!;
     }

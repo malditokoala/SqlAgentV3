@@ -8,11 +8,11 @@ namespace SqlAgent.Domain.Entities
     {
         public Guid Id { get; set; }
         public Guid ProfileId { get; set; }
-        public string VersionName { get; set; } = null!;
+        public string VersionName { get; set; } = string.Empty;
         public string Status { get; set; } = "Draft"; // Draft, Published, Archived
 
         public Profile Profile { get; set; } = null!;
-        public DataSource? DataSource { get; set; }
+        public DataSource DataSource { get; set; } = null!;
         public ICollection<Entity> Entities { get; set; } = new List<Entity>();
         public ICollection<Relationship> Relationships { get; set; } = new List<Relationship>();
         public ICollection<Metric> Metrics { get; set; } = new List<Metric>();

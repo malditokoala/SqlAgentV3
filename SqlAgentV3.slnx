@@ -1,4 +1,5 @@
 <Solution>
+  <Project Path="SqlAgent.ConsoleApp/SqlAgent.ConsoleApp.csproj" />
   <Project Path="SqlAgent.Domain/SqlAgent.Domain.csproj" />
   <Project Path="SqlAgent.Infrastructure/SqlAgent.Infrastructure.csproj" />
 </Solution>

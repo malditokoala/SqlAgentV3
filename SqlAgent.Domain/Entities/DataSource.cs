@@ -8,9 +8,10 @@ namespace SqlAgent.Domain.Entities
     {
         public Guid Id { get; set; }
         public Guid VersionId { get; set; }
-        public string ConnectionStringName { get; set; } = null!;
+        public string ConnectionStringName { get; set; } = string.Empty;
         public string Engine { get; set; } = "SqlServer";
 
         public ProfileVersion Version { get; set; } = null!;
     }
+
 }
