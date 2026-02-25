@@ -1,15 +1,9 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using SqlAgent.Domain.Models;
+﻿using SqlAgent.Domain.Models;
 using SqlAgent.Domain.Interfaces;
+using SqlAgent.Domain.Exceptions;
 
 namespace SqlAgent.Domain.Services;
 
-/// <summary>
-/// Previene la multiplicación silenciosa de filas en consultas que involucran JOINs y agrupaciones (GROUP BY).
-/// Implementación de la directiva "Business Correctness" de la Arquitectura v3.0.
-/// </summary>
 public class CardinalityGuard
 {
     private readonly ISchemaProvider _schema;
@@ -19,54 +13,49 @@ public class CardinalityGuard
         _schema = schema;
     }
 
-    /// <summary>
-    /// Analiza y muta el QueryModel para asegurar que las agrupaciones sean seguras.
-    /// </summary>
-    public void EnsureSafeGrouping(QueryModel query)
+    public QueryModel EnsureSafeGrouping(QueryModel query)
     {
-        // 1. Si no hay agrupaciones solicitadas, no hay riesgo de sumarizados incorrectos.
-        if (query.GroupByLogical == null || !query.GroupByLogical.Any())
-            return;
+        bool hasAggregation = !string.IsNullOrEmpty(query.MetricLogical);
+        bool hasJoins = query.JoinsLogical?.Any() == true;
 
-        // 2. Si no hay JOINs, la cardinalidad de la tabla base se mantiene intacta.
-        if (query.JoinsLogical == null || !query.JoinsLogical.Any())
-            return;
+        if (!hasAggregation || !hasJoins) return query;
 
-        // 3. Determinar qué entidades están involucradas en la consulta
-        var involvedEntities = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { query.EntityLogical };
-        foreach (var join in query.JoinsLogical)
-        {
+        var involvedEntities = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { query.EntityLogical };
+
+        foreach (var join in query.JoinsLogical!)
             involvedEntities.Add(join.ToEntityLogical);
-        }
 
-        // 4. Buscar si alguna de las entidades involucradas tiene definido un 'DefaultGrainField'
-        //    (la llave primaria lógica que define la granularidad de esa entidad).
+        // HashSet elimina duplicados entre entidades que comparten campos de grain
         var requiredGrainFields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var entity in involvedEntities)
         {
-            var grainField = _schema.GetDefaultGrainField(entity);
-            if (!string.IsNullOrEmpty(grainField))
-            {
-                requiredGrainFields.Add(grainField);
-            }
+            var grainRaw = _schema.GetDefaultGrainFields(entity);
+
+            if (string.IsNullOrWhiteSpace(grainRaw))
+                throw new CardinalityViolationException(
+                    $"La entidad '{entity}' no tiene DefaultGrainFields definido. " +
+                    $"No es posible generar un GROUP BY seguro para una consulta con JOINs y métricas. " +
+                    $"Ve a Admin > Entities > {entity} > DefaultGrainFields. " +
+                    $"Ejemplo: 'OrderId' o 'OrderId,ProductId'.");
+
+            var fields = grainRaw.Split(',',
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            // Formato "EntityLogical.FieldLogical" para que QueryBinder sepa de donde resolver
+            foreach (var f in fields)
+                requiredGrainFields.Add($"{entity}.{f}");
         }
 
-        // 5. Inyectar forzosamente los DefaultGrainFields en el GROUP BY y en el SELECT
-        //    si no estaban presentes.
+        var newGroupBy = new List<string>(query.GroupByLogical ?? []);
+
         foreach (var grainField in requiredGrainFields)
         {
-            // El formato esperado es "EntityLogical.FieldLogical"
-            if (!query.GroupByLogical.Contains(grainField, StringComparer.OrdinalIgnoreCase))
-            {
-                query.GroupByLogical.Add(grainField);
-
-                // Si lo agrupamos, también debemos seleccionarlo para que la consulta sea válida en SQL
-                if (!query.FieldsLogical.Contains(grainField, StringComparer.OrdinalIgnoreCase))
-                {
-                    query.FieldsLogical.Add(grainField);
-                }
-            }
+            if (!newGroupBy.Contains(grainField, StringComparer.OrdinalIgnoreCase))
+                newGroupBy.Add(grainField);
         }
+
+        return query with { GroupByLogical = newGroupBy };
     }
 }

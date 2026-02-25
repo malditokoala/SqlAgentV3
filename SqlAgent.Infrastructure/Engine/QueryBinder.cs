@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using SqlKata;
 using SqlKata.Compilers;
 using SqlAgent.Domain.Models;
@@ -6,73 +7,164 @@ using SqlAgent.Domain.Interfaces;
 
 namespace SqlAgent.Infrastructure.Engine;
 
-/// <summary>
-/// La única clase autorizada para traducir LogicalName a PhysicalName usando el SchemaProvider.
-/// </summary>
 public class QueryBinder
 {
     private readonly ISchemaProvider _schema;
+    private readonly IRelationshipResolver _relationships;
     private readonly SqlServerCompiler _compiler;
 
-    public QueryBinder(ISchemaProvider schema)
+    public QueryBinder(ISchemaProvider schema, IRelationshipResolver relationships)
     {
         _schema = schema;
+        _relationships = relationships;
         _compiler = new SqlServerCompiler();
     }
 
-    /// <summary>
-    /// Convierte la intención del LLM (QueryModel) en una consulta SQL ejecutable.
-    /// </summary>
     public SqlResult Bind(QueryModel intent)
     {
-        // 1. Resolver tabla principal
-        var mainTablePhysical = _schema.ResolvePhysicalTable(intent.EntityLogical);
-        var query = new Query(mainTablePhysical);
+        // 1. Tabla principal con alias
+        var mainPhysical = _schema.ResolvePhysicalTable(intent.EntityLogical);
+        var mainAlias = _schema.GetAlias(intent.EntityLogical);
+        var query = new Query($"{mainPhysical} AS {mainAlias}");
 
-        // 2. Resolver SELECT
-        if (intent.FieldsLogical != null && intent.FieldsLogical.Count > 0)
+        // 2. TOP — un solo bloque
+        if (intent.Top.HasValue)
+        {
+            if (intent.OrderBy is null)
+                query = query.Take(intent.Top.Value);  // genera SELECT TOP N o OFFSET (parcheado abajo)
+            else
+                query.Limit(intent.Top.Value);         // genera OFFSET/FETCH con ORDER BY
+        }
+
+        // 3. SELECT
+        if (intent.FieldsLogical is { Count: > 0 })
         {
             foreach (var fieldLogical in intent.FieldsLogical)
             {
-                var physicalField = _schema.ResolvePhysicalField(intent.EntityLogical, fieldLogical);
-                query.Select($"{mainTablePhysical}.{physicalField} AS {fieldLogical}");
+                string entityPart, fieldPart;
+                if (fieldLogical.Contains('.'))
+                {
+                    var parts = fieldLogical.Split('.', 2);
+                    entityPart = parts[0];
+                    fieldPart = parts[1];
+                }
+                else
+                {
+                    entityPart = intent.EntityLogical;
+                    fieldPart = fieldLogical;
+                }
+
+                var alias = _schema.GetAlias(entityPart);
+                var physical = _schema.ResolvePhysicalField(entityPart, fieldPart);
+                query.Select($"{alias}.{physical} as {fieldPart}");
             }
         }
         else
         {
-            query.Select($"{mainTablePhysical}.*");
+            query.Select($"{mainAlias}.*");
         }
 
-        // 3. Resolver JOINs
-        if (intent.JoinsLogical != null)
+        // 4. JOINs
+        if (intent.JoinsLogical is { Count: > 0 })
         {
             foreach (var join in intent.JoinsLogical)
             {
-                // En la Fase 2, aquí es donde inyectamos la lógica de RelationshipResolver
-                // Por ahora, asumimos que el LLM nos dice qué unir, pero nosotros 
-                // traducimos los nombres de las tablas.
-                var targetTablePhysical = _schema.ResolvePhysicalTable(join.ToEntityLogical);
+                var targetPhysical = _schema.ResolvePhysicalTable(join.ToEntityLogical);
+                var targetAlias = _schema.GetAlias(join.ToEntityLogical);
+                var condition = _relationships.BuildJoinCondition(
+                    intent.EntityLogical, join.ToEntityLogical);
 
-                // NOTA: Para un JOIN real dinámico, necesitamos leer "JoinCondition" de la tabla Relationships.
-                // Esta es una versión simplificada para la primera iteración del pipeline.
-                query.Join(targetTablePhysical, j => j.WhereRaw("1=1")); // TODO: Implementar RelationshipResolver
+                query.Join($"{targetPhysical} AS {targetAlias}", j => j.WhereRaw(condition));
             }
         }
 
-        // 4. Resolver WHERE (Filtros)
-        if (intent.Filters != null)
+        // 5. WHERE
+        if (intent.Filters is { Count: > 0 })
         {
             foreach (var filter in intent.Filters)
             {
+                var physicalAlias = _schema.GetAlias(filter.EntityLogical);
                 var physicalField = _schema.ResolvePhysicalField(filter.EntityLogical, filter.FieldLogical);
-                var physicalTable = _schema.ResolvePhysicalTable(filter.EntityLogical);
-
-                // SqlKata maneja automáticamente la parametrización para evitar SQL Injection
-                query.Where($"{physicalTable}.{physicalField}", filter.Operator, filter.Value);
+                query.Where($"{physicalAlias}.{physicalField}", filter.Operator, filter.Value);
             }
         }
 
-        // 5. Compilar a SQL string y parámetros (Dapper-ready)
-        return _compiler.Compile(query);
+        // 6. GROUP BY — soporta "EntityLogical.FieldLogical" y "FieldLogical"
+        if (intent.GroupByLogical is { Count: > 0 })
+        {
+            foreach (var groupField in intent.GroupByLogical)
+            {
+                string entityPart, fieldPart;
+                if (groupField.Contains('.'))
+                {
+                    var parts = groupField.Split('.', 2);
+                    entityPart = parts[0];
+                    fieldPart = parts[1];
+                }
+                else
+                {
+                    entityPart = intent.EntityLogical;
+                    fieldPart = groupField;
+                }
+
+                var alias = _schema.GetAlias(entityPart);
+                var physical = _schema.ResolvePhysicalField(entityPart, fieldPart);
+                query.GroupBy($"{alias}.{physical}");
+            }
+        }
+
+        // 7. ORDER BY — tipo discriminado
+        if (intent.OrderBy is not null)
+        {
+            switch (intent.OrderBy)
+            {
+                case FieldOrderBy fo:
+                    var foAlias = _schema.GetAlias(fo.EntityLogical);
+                    var foField = _schema.ResolvePhysicalField(fo.EntityLogical, fo.FieldLogical);
+                    if (intent.OrderDescending) query.OrderByDesc($"{foAlias}.{foField}");
+                    else query.OrderBy($"{foAlias}.{foField}");
+                    break;
+
+                case MetricOrderBy mo:
+                    if (intent.OrderDescending) query.OrderByRaw($"{mo.MetricLogical} DESC");
+                    else query.OrderByRaw($"{mo.MetricLogical} ASC");
+                    break;
+            }
+        }
+
+        // --- COMPILACIÓN Y PARCHEO SQLKATA 4.X ---
+        var result = _compiler.Compile(query);
+
+        // SqlKata 4.x genera OFFSET/FETCH cuando hay GROUP BY + Take().
+        // Si hay Top sin OrderBy explícito, reemplazamos por SELECT TOP N.
+        if (intent.Top.HasValue && intent.OrderBy is null)
+            return PatchTopN(result, intent.Top.Value);
+
+        return result;
+    }
+
+    private static SqlResult PatchTopN(SqlResult result, int top)
+    {
+        // Eliminar "ORDER BY (SELECT 0) OFFSET @p0 ROWS FETCH NEXT @p1 ROWS ONLY"
+        var sql = result.Sql;
+        var offsetIdx = sql.IndexOf("ORDER BY (SELECT 0)", StringComparison.OrdinalIgnoreCase);
+
+        if (offsetIdx > 0)
+            sql = sql[..offsetIdx].TrimEnd();
+
+        // Insertar TOP N después del SELECT
+        sql = sql.Replace("SELECT ", $"SELECT TOP {top} ", StringComparison.OrdinalIgnoreCase);
+
+        // Eliminar los bindings de OFFSET/FETCH (@p0, @p1) que ya no aplican
+        var cleanBindings = result.NamedBindings
+            .Where(kvp => kvp.Key != "p0" && kvp.Key != "p1")
+            .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+
+        // Mutar el objeto de compilación existente en lugar de instanciar uno nuevo
+        result.Sql = sql;
+        result.Bindings = cleanBindings.Values.ToList();
+        result.NamedBindings = cleanBindings;
+
+        return result;
     }
 }

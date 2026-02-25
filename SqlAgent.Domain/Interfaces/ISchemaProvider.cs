@@ -1,6 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Threading.Tasks;
+﻿// SqlAgent.Domain/Interfaces/ISchemaProvider.cs
 using SqlAgent.Domain.Entities;
 
 namespace SqlAgent.Domain.Interfaces;
@@ -11,18 +9,22 @@ public interface ISchemaProvider
     bool FieldExists(string entityLogical, string fieldLogical);
     string ResolvePhysicalTable(string logicalName);
     string ResolvePhysicalField(string entityLogical, string fieldLogical);
-    string GetDefaultGrainField(string entityLogical);
+    string GetAlias(string logicalName);
+    string GetCategory(string logicalName);
+    string? GetDefaultGrainFields(string logicalName); // plural, nullable
 }
 
 public interface IRelationshipResolver
 {
-    string GetJoinCondition(string sourceLogical, string targetLogical);
+    string BuildJoinCondition(string fromLogical, string toLogical); // construye el ON físico
+    bool RelationshipExists(string fromLogical, string toLogical);
 }
 
 public interface ICatalogRepository
 {
+    Task<Profile> GetProfileAsync(Guid profileId);
+    Task<ProfileVersion> GetVersionAsync(Guid versionId);
     Task<IEnumerable<Entity>> GetEntitiesAsync(Guid versionId);
     Task<IEnumerable<Field>> GetFieldsAsync(Guid entityId);
-    // Método necesario para cargar relaciones
     Task<IEnumerable<Relationship>> GetRelationshipsAsync(Guid versionId);
 }

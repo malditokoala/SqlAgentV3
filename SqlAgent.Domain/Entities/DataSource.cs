@@ -12,6 +12,6 @@ namespace SqlAgent.Domain.Entities
         public string Engine { get; set; } = "SqlServer";
 
         public ProfileVersion Version { get; set; } = null!;
-    }
 
+    }
 }

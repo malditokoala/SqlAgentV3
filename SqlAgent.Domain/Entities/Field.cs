@@ -14,6 +14,5 @@ namespace SqlAgent.Domain.Entities
         public string DataType { get; set; } = "string";
 
         public Entity Entity { get; set; } = null!;
-        public ICollection<Synonym> Synonyms { get; set; } = new List<Synonym>();
     }
 }
