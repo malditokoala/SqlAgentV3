@@ -1,5 +1,7 @@
-﻿using System;
+﻿// SqlAgent.Infrastructure/Engine/QueryBinder.cs
+using System;
 using System.Linq;
+using System.Collections.Generic;
 using SqlKata;
 using SqlKata.Compilers;
 using SqlAgent.Domain.Models;
@@ -15,8 +17,8 @@ public class QueryBinder
 
     public QueryBinder(ISchemaProvider schema, IRelationshipResolver relationships)
     {
-        _schema = schema;
-        _relationships = relationships;
+        _schema = schema ?? throw new ArgumentNullException(nameof(schema));
+        _relationships = relationships ?? throw new ArgumentNullException(nameof(relationships));
         _compiler = new SqlServerCompiler();
     }
 
@@ -27,41 +29,34 @@ public class QueryBinder
         var mainAlias = _schema.GetAlias(intent.EntityLogical);
         var query = new Query($"{mainPhysical} AS {mainAlias}");
 
-        // 2. TOP — un solo bloque
-        if (intent.Top.HasValue)
-        {
-            if (intent.OrderBy is null)
-                query = query.Take(intent.Top.Value);  // genera SELECT TOP N o OFFSET (parcheado abajo)
-            else
-                query.Limit(intent.Top.Value);         // genera OFFSET/FETCH con ORDER BY
-        }
-
-        // 3. SELECT
+        // 2. SELECT
         if (intent.FieldsLogical is { Count: > 0 })
         {
             foreach (var fieldLogical in intent.FieldsLogical)
             {
-                string entityPart, fieldPart;
-                if (fieldLogical.Contains('.'))
-                {
-                    var parts = fieldLogical.Split('.', 2);
-                    entityPart = parts[0];
-                    fieldPart = parts[1];
-                }
-                else
-                {
-                    entityPart = intent.EntityLogical;
-                    fieldPart = fieldLogical;
-                }
-
-                var alias = _schema.GetAlias(entityPart);
-                var physical = _schema.ResolvePhysicalField(entityPart, fieldPart);
-                query.Select($"{alias}.{physical} as {fieldPart}");
+                var parts = fieldLogical.Split('.', 2);
+                var entity = parts.Length > 1 ? parts[0] : intent.EntityLogical;
+                var field = parts.Length > 1 ? parts[1] : parts[0];
+                var alias = _schema.GetAlias(entity);
+                var physical = _schema.ResolvePhysicalField(entity, field);
+                query.Select($"{alias}.{physical} AS {field}");
             }
         }
         else
         {
             query.Select($"{mainAlias}.*");
+        }
+
+        // 3. MÉTRICAS
+        if (!string.IsNullOrEmpty(intent.MetricLogical))
+        {
+            if (intent.MetricLogical.Equals("Revenue", StringComparison.OrdinalIgnoreCase))
+            {
+                var odAlias = _schema.GetAlias("OrderDetail");
+                var up = _schema.ResolvePhysicalField("OrderDetail", "UnitPrice");
+                var qty = _schema.ResolvePhysicalField("OrderDetail", "Quantity");
+                query.SelectRaw($"SUM({odAlias}.{up} * {odAlias}.{qty}) AS Revenue");
+            }
         }
 
         // 4. JOINs
@@ -72,9 +67,12 @@ public class QueryBinder
                 var targetPhysical = _schema.ResolvePhysicalTable(join.ToEntityLogical);
                 var targetAlias = _schema.GetAlias(join.ToEntityLogical);
                 var condition = _relationships.BuildJoinCondition(
-                    intent.EntityLogical, join.ToEntityLogical);
+                    join.FromEntityLogical, join.ToEntityLogical);
 
-                query.Join($"{targetPhysical} AS {targetAlias}", j => j.WhereRaw(condition));
+                if (join.JoinType.Equals("LEFT", StringComparison.OrdinalIgnoreCase))
+                    query.LeftJoin($"{targetPhysical} AS {targetAlias}", j => j.WhereRaw(condition));
+                else
+                    query.Join($"{targetPhysical} AS {targetAlias}", j => j.WhereRaw(condition));
             }
         }
 
@@ -83,9 +81,9 @@ public class QueryBinder
         {
             foreach (var filter in intent.Filters)
             {
-                var physicalAlias = _schema.GetAlias(filter.EntityLogical);
-                var physicalField = _schema.ResolvePhysicalField(filter.EntityLogical, filter.FieldLogical);
-                query.Where($"{physicalAlias}.{physicalField}", filter.Operator, filter.Value);
+                var alias = _schema.GetAlias(filter.EntityLogical);
+                var physical = _schema.ResolvePhysicalField(filter.EntityLogical, filter.FieldLogical);
+                query.Where($"{alias}.{physical}", filter.Operator, filter.Value);
             }
         }
 
@@ -94,21 +92,11 @@ public class QueryBinder
         {
             foreach (var groupField in intent.GroupByLogical)
             {
-                string entityPart, fieldPart;
-                if (groupField.Contains('.'))
-                {
-                    var parts = groupField.Split('.', 2);
-                    entityPart = parts[0];
-                    fieldPart = parts[1];
-                }
-                else
-                {
-                    entityPart = intent.EntityLogical;
-                    fieldPart = groupField;
-                }
-
-                var alias = _schema.GetAlias(entityPart);
-                var physical = _schema.ResolvePhysicalField(entityPart, fieldPart);
+                var parts = groupField.Split('.', 2);
+                var entity = parts.Length > 1 ? parts[0] : intent.EntityLogical;
+                var field = parts.Length > 1 ? parts[1] : parts[0];
+                var alias = _schema.GetAlias(entity);
+                var physical = _schema.ResolvePhysicalField(entity, field);
                 query.GroupBy($"{alias}.{physical}");
             }
         }
@@ -132,38 +120,42 @@ public class QueryBinder
             }
         }
 
-        // --- COMPILACIÓN Y PARCHEO SQLKATA 4.X ---
+        // 8. TOP
+        if (intent.Top.HasValue)
+            query.Limit(intent.Top.Value);
+
+        // 9. Compilar y parchear SqlKata 4.x
         var result = _compiler.Compile(query);
-
-        // SqlKata 4.x genera OFFSET/FETCH cuando hay GROUP BY + Take().
-        // Si hay Top sin OrderBy explícito, reemplazamos por SELECT TOP N.
-        if (intent.Top.HasValue && intent.OrderBy is null)
-            return PatchTopN(result, intent.Top.Value);
-
-        return result;
+        return ApplySqlServerFixes(result, intent);
     }
 
-    private static SqlResult PatchTopN(SqlResult result, int top)
+    /// <summary>
+    /// SqlKata 4.x genera OFFSET/FETCH con un ORDER BY (SELECT 0) espurio
+    /// cuando hay GROUP BY + Limit sin un ORDER BY real.
+    /// Este método lo reemplaza por SELECT TOP N.
+    /// </summary>
+    private static SqlResult ApplySqlServerFixes(SqlResult result, QueryModel intent)
     {
-        // Eliminar "ORDER BY (SELECT 0) OFFSET @p0 ROWS FETCH NEXT @p1 ROWS ONLY"
+        if (!intent.Top.HasValue || intent.OrderBy is not null)
+            return result;
+
         var sql = result.Sql;
         var offsetIdx = sql.IndexOf("ORDER BY (SELECT 0)", StringComparison.OrdinalIgnoreCase);
 
-        if (offsetIdx > 0)
-            sql = sql[..offsetIdx].TrimEnd();
+        if (offsetIdx < 0)
+            return result;
 
-        // Insertar TOP N después del SELECT
-        sql = sql.Replace("SELECT ", $"SELECT TOP {top} ", StringComparison.OrdinalIgnoreCase);
+        // Quitar ORDER BY espurio + OFFSET/FETCH
+        sql = sql[..offsetIdx].TrimEnd();
 
-        // Eliminar los bindings de OFFSET/FETCH (@p0, @p1) que ya no aplican
-        var cleanBindings = result.NamedBindings
-            .Where(kvp => kvp.Key != "p0" && kvp.Key != "p1")
-            .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+        // Inyectar TOP N después del SELECT
+        sql = sql.Replace("SELECT ", $"SELECT TOP {intent.Top.Value} ",
+            StringComparison.OrdinalIgnoreCase);
 
-        // Mutar el objeto de compilación existente en lugar de instanciar uno nuevo
+        // Quitar bindings de OFFSET/FETCH que ya no aplican
         result.Sql = sql;
-        result.Bindings = cleanBindings.Values.ToList();
-        result.NamedBindings = cleanBindings;
+        result.NamedBindings.Remove("p0");
+        result.NamedBindings.Remove("p1");
 
         return result;
     }

@@ -1,9 +1,16 @@
-﻿using SqlAgent.Domain.Models;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using SqlAgent.Domain.Models;
 using SqlAgent.Domain.Interfaces;
 using SqlAgent.Domain.Exceptions;
 
 namespace SqlAgent.Domain.Services;
 
+/// <summary>
+/// Previene la multiplicación silenciosa de filas en consultas que involucran JOINs y agrupaciones (GROUP BY).
+/// Inyecta automáticamente los campos de grano en las cláusulas GROUP BY y SELECT.
+/// </summary>
 public class CardinalityGuard
 {
     private readonly ISchemaProvider _schema;
@@ -18,6 +25,7 @@ public class CardinalityGuard
         bool hasAggregation = !string.IsNullOrEmpty(query.MetricLogical);
         bool hasJoins = query.JoinsLogical?.Any() == true;
 
+        // Si no hay métricas (agregaciones) o no hay joins, no hay riesgo de abanico (fan-out).
         if (!hasAggregation || !hasJoins) return query;
 
         var involvedEntities = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -49,13 +57,24 @@ public class CardinalityGuard
         }
 
         var newGroupBy = new List<string>(query.GroupByLogical ?? []);
+        var newFields = new List<string>(query.FieldsLogical ?? []); // <-- Lista para inyectar en el SELECT
 
         foreach (var grainField in requiredGrainFields)
         {
+            // 1. Inyectar en el GROUP BY para garantizar la cardinalidad segura en SQL Server
             if (!newGroupBy.Contains(grainField, StringComparer.OrdinalIgnoreCase))
                 newGroupBy.Add(grainField);
+
+            // 2. Inyectar en el SELECT para que la BD devuelva la columna y Dapper la pueda mapear
+            if (!newFields.Contains(grainField, StringComparer.OrdinalIgnoreCase))
+                newFields.Add(grainField);
         }
 
-        return query with { GroupByLogical = newGroupBy };
+        // Retornar el record mutado de forma segura con ambas colecciones actualizadas
+        return query with
+        {
+            GroupByLogical = newGroupBy,
+            FieldsLogical = newFields
+        };
     }
 }

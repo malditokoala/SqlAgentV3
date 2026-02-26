@@ -1,4 +1,8 @@
-﻿using SqlAgent.Domain.Interfaces;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using SqlAgent.Domain.Interfaces;
 
 namespace SqlAgent.Infrastructure.Services;
 
@@ -34,6 +38,10 @@ public class ProfileService : ISchemaProvider, IRelationshipResolver
         VersionId = versionId;
     }
 
+    /// <summary>
+    /// Carga el catálogo de metadatos desde el repositorio y lo prepara para el motor.
+    /// </summary>
+    /// 
     public static async Task<ProfileService> LoadAsync(Guid versionId, ICatalogRepository catalog)
     {
         var entities = await catalog.GetEntitiesAsync(versionId);
@@ -67,6 +75,8 @@ public class ProfileService : ISchemaProvider, IRelationshipResolver
                 rel.ToEntityLogical, rel.ToFieldLogical,
                 rel.JoinType);
 
+            // Guardamos la relación en ambos sentidos para que el buscador de rutas (BFS) 
+            // pueda navegar el grafo bidireccionalmente.
             var key = (rel.FromEntityLogical, rel.ToEntityLogical);
             var reverseKey = (rel.ToEntityLogical, rel.FromEntityLogical);
 
@@ -88,10 +98,12 @@ public class ProfileService : ISchemaProvider, IRelationshipResolver
     {
         if (!_entities.TryGetValue(entityLogical, out var e))
             throw new InvalidOperationException($"Entidad '{entityLogical}' no existe.");
+
         if (!e.PhysicalFields.TryGetValue(fieldLogical, out var physical))
             throw new InvalidOperationException(
                 $"Campo '{fieldLogical}' no existe en '{entityLogical}'. " +
                 $"Disponibles: {string.Join(", ", e.PhysicalFields.Keys)}");
+
         return physical;
     }
 
@@ -107,9 +119,15 @@ public class ProfileService : ISchemaProvider, IRelationshipResolver
         _entities.TryGetValue(logicalName, out var data) ? data.DefaultGrainFields : null;
 
     public bool EntityExists(string logicalName) => _entities.ContainsKey(logicalName);
-    public bool FieldExists(string e, string f) => _entities.TryGetValue(e, out var ed) && ed.PhysicalFields.ContainsKey(f);
+
+    public bool FieldExists(string e, string f) =>
+        _entities.TryGetValue(e, out var ed) && ed.PhysicalFields.ContainsKey(f);
 
     // ── IRelationshipResolver ──
+
+    /// <summary>
+    /// Genera la condición SQL física (ON) para unir dos tablas.
+    /// </summary>
     public string BuildJoinCondition(string fromLogical, string toLogical)
     {
         if (!_relationships.TryGetValue((fromLogical, toLogical), out var rel))
@@ -126,4 +144,16 @@ public class ProfileService : ISchemaProvider, IRelationshipResolver
 
     public bool RelationshipExists(string fromLogical, string toLogical) =>
         _relationships.ContainsKey((fromLogical, toLogical));
+
+    /// <summary>
+    /// Devuelve todas las conexiones (aristas) disponibles en el catálogo.
+    /// Implementación necesaria para el JoinPlanner (BFS).
+    /// </summary>
+    // En ProfileService — reemplazar el método GetAvailableEdges:
+    public IReadOnlyList<RelationshipEdge> GetAvailableEdges() =>
+        _relationships
+            .Where(kvp => kvp.Value.FromEntityLogical == kvp.Key.Item1) // solo dirección original
+            .Select(kvp => new RelationshipEdge(kvp.Key.Item1, kvp.Key.Item2))
+            .ToList();
+
 }
