@@ -8,7 +8,7 @@ namespace SqlAgent.Domain.Services;
 
 /// <summary>
 /// Implementación de la Fase 2: Inteligencia de Enrutamiento.
-/// Calcula la ruta óptima de JOINs entre entidades para evitar que el LLM alucine relaciones.
+/// Calcula la ruta óptima de JOINs y detecta dependencias implícitas en métricas.
 /// </summary>
 public class JoinPlanner
 {
@@ -19,34 +19,36 @@ public class JoinPlanner
         _resolver = resolver;
     }
 
-    /// <summary>
-    /// Analiza el QueryModel y autocompleta la lista de JoinsLogical basándose en el grafo del catálogo.
-    /// </summary>
     public QueryModel Plan(QueryModel query)
     {
-        // 1. Extraer todas las entidades necesarias de la consulta
         var requiredEntities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        // De los campos seleccionados (Formato: "Entidad.Campo")
+        
+        // 1. Detectar entidades en campos (e.g., "OrderDetail.Quantity")
         foreach (var field in query.FieldsLogical.Where(f => f.Contains('.')))
             requiredEntities.Add(field.Split('.')[0]);
 
-        // De los filtros
+        // 2. Detectar entidades en filtros
         if (query.Filters != null)
             foreach (var filter in query.Filters)
                 requiredEntities.Add(filter.EntityLogical);
 
-        // De las agrupaciones
+        // 3. Detectar entidades en agrupaciones
         if (query.GroupByLogical != null)
             foreach (var group in query.GroupByLogical.Where(g => g.Contains('.')))
                 requiredEntities.Add(group.Split('.')[0]);
 
-        // La entidad base no necesita ser unida a sí misma
+        // 4. FIX: Detectar entidades requeridas por la métrica (KPI)
+        // Esto previene el error "multi-part identifier could not be bound"
+        if (!string.IsNullOrEmpty(query.MetricLogical))
+        {
+            if (query.MetricLogical.Equals("Revenue", StringComparison.OrdinalIgnoreCase))
+                requiredEntities.Add("OrderDetail");
+        }
+
         requiredEntities.Remove(query.EntityLogical);
 
         if (!requiredEntities.Any()) return query;
 
-        // 2. Construir el grafo de adyacencia desde el catálogo
         var edges = _resolver.GetAvailableEdges();
         var graph = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 
@@ -56,7 +58,6 @@ public class JoinPlanner
             graph[edge.Source].Add(edge.Target);
         }
 
-        // 3. Calcular la ruta para cada entidad requerida
         var finalJoins = new List<JoinModel>();
         var joinedEntities = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { query.EntityLogical };
 
@@ -65,11 +66,9 @@ public class JoinPlanner
             if (joinedEntities.Contains(target)) continue;
 
             var path = FindPathBFS(graph, joinedEntities, target);
-
             if (path == null)
                 throw new InvalidOperationException($"JoinPlanner: No existe una ruta válida en el catálogo para llegar a '{target}'.");
 
-            // Convertir la ruta en modelos de Join
             for (int i = 0; i < path.Count - 1; i++)
             {
                 var from = path[i];
@@ -83,7 +82,6 @@ public class JoinPlanner
             }
         }
 
-        // Devolvemos el modelo actualizado con la estrategia de JOINs calculada
         return query with { JoinsLogical = finalJoins };
     }
 
@@ -102,9 +100,7 @@ public class JoinPlanner
         {
             var path = queue.Dequeue();
             var current = path.Last();
-
-            if (current.Equals(target, StringComparison.OrdinalIgnoreCase))
-                return path;
+            if (current.Equals(target, StringComparison.OrdinalIgnoreCase)) return path;
 
             if (graph.TryGetValue(current, out var neighbors))
             {
@@ -119,7 +115,6 @@ public class JoinPlanner
                 }
             }
         }
-
         return null;
     }
 }

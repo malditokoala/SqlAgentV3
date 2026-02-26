@@ -1,35 +1,49 @@
-﻿// SqlAgent.Infrastructure/Engine/QueryBinder.cs
-using System;
+﻿using System;
 using System.Linq;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
 using SqlKata;
 using SqlKata.Compilers;
 using SqlAgent.Domain.Models;
 using SqlAgent.Domain.Interfaces;
+using Microsoft.Extensions.Logging;
 
 namespace SqlAgent.Infrastructure.Engine;
 
+/// <summary>
+/// Traduce un QueryModel (Lógico) a un SqlResult (Físico).
+/// Implementa los parches de compatibilidad para SQL Server y SqlKata 4.x.
+/// </summary>
 public class QueryBinder
 {
     private readonly ISchemaProvider _schema;
     private readonly IRelationshipResolver _relationships;
     private readonly SqlServerCompiler _compiler;
+    private readonly ILogger<QueryBinder>? _logger;
 
-    public QueryBinder(ISchemaProvider schema, IRelationshipResolver relationships)
+    public QueryBinder(
+        ISchemaProvider schema,
+        IRelationshipResolver relationships,
+        ILogger<QueryBinder>? logger = null)
     {
         _schema = schema ?? throw new ArgumentNullException(nameof(schema));
         _relationships = relationships ?? throw new ArgumentNullException(nameof(relationships));
         _compiler = new SqlServerCompiler();
+        _logger = logger;
     }
 
     public SqlResult Bind(QueryModel intent)
     {
-        // 1. Tabla principal con alias
+        _logger?.LogDebug("═══ QueryBinder.Bind() INICIO ═══");
+
+        // 0. Resolver tabla principal
         var mainPhysical = _schema.ResolvePhysicalTable(intent.EntityLogical);
         var mainAlias = _schema.GetAlias(intent.EntityLogical);
         var query = new Query($"{mainPhysical} AS {mainAlias}");
 
-        // 2. SELECT
+        // 1. SELECT (Proyección)
+        bool hasSelectColumns = false;
+
         if (intent.FieldsLogical is { Count: > 0 })
         {
             foreach (var fieldLogical in intent.FieldsLogical)
@@ -37,17 +51,15 @@ public class QueryBinder
                 var parts = fieldLogical.Split('.', 2);
                 var entity = parts.Length > 1 ? parts[0] : intent.EntityLogical;
                 var field = parts.Length > 1 ? parts[1] : parts[0];
+
                 var alias = _schema.GetAlias(entity);
                 var physical = _schema.ResolvePhysicalField(entity, field);
                 query.Select($"{alias}.{physical} AS {field}");
+                hasSelectColumns = true;
             }
         }
-        else
-        {
-            query.Select($"{mainAlias}.*");
-        }
 
-        // 3. MÉTRICAS
+        // 2. METRIC (KPI)
         if (!string.IsNullOrEmpty(intent.MetricLogical))
         {
             if (intent.MetricLogical.Equals("Revenue", StringComparison.OrdinalIgnoreCase))
@@ -55,28 +67,38 @@ public class QueryBinder
                 var odAlias = _schema.GetAlias("OrderDetail");
                 var up = _schema.ResolvePhysicalField("OrderDetail", "UnitPrice");
                 var qty = _schema.ResolvePhysicalField("OrderDetail", "Quantity");
+
+                // Usamos interpolación directa con alias seguros para evitar que SqlKata escape de más
                 query.SelectRaw($"SUM({odAlias}.{up} * {odAlias}.{qty}) AS Revenue");
+                hasSelectColumns = true;
             }
         }
 
-        // 4. JOINs
+        // GUARD: Evitar SQL vacío si no hay proyección
+        if (!hasSelectColumns)
+        {
+            query.Select($"{mainAlias}.*");
+        }
+
+        // 3. JOINs (Inyectados por el JoinPlanner)
         if (intent.JoinsLogical is { Count: > 0 })
         {
             foreach (var join in intent.JoinsLogical)
             {
-                var targetPhysical = _schema.ResolvePhysicalTable(join.ToEntityLogical);
+                var targetTable = _schema.ResolvePhysicalTable(join.ToEntityLogical);
                 var targetAlias = _schema.GetAlias(join.ToEntityLogical);
-                var condition = _relationships.BuildJoinCondition(
-                    join.FromEntityLogical, join.ToEntityLogical);
+                var condition = _relationships.BuildJoinCondition(join.FromEntityLogical, join.ToEntityLogical);
+
+                _logger?.LogDebug("Aplicando JOIN: {Table} AS {Alias}", targetTable, targetAlias);
 
                 if (join.JoinType.Equals("LEFT", StringComparison.OrdinalIgnoreCase))
-                    query.LeftJoin($"{targetPhysical} AS {targetAlias}", j => j.WhereRaw(condition));
+                    query.LeftJoin($"{targetTable} AS {targetAlias}", j => j.WhereRaw(condition));
                 else
-                    query.Join($"{targetPhysical} AS {targetAlias}", j => j.WhereRaw(condition));
+                    query.Join($"{targetTable} AS {targetAlias}", j => j.WhereRaw(condition));
             }
         }
 
-        // 5. WHERE
+        // 4. WHERE (Filtros)
         if (intent.Filters is { Count: > 0 })
         {
             foreach (var filter in intent.Filters)
@@ -87,12 +109,12 @@ public class QueryBinder
             }
         }
 
-        // 6. GROUP BY — soporta "EntityLogical.FieldLogical" y "FieldLogical"
+        // 5. GROUP BY
         if (intent.GroupByLogical is { Count: > 0 })
         {
-            foreach (var groupField in intent.GroupByLogical)
+            foreach (var g in intent.GroupByLogical)
             {
-                var parts = groupField.Split('.', 2);
+                var parts = g.Split('.', 2);
                 var entity = parts.Length > 1 ? parts[0] : intent.EntityLogical;
                 var field = parts.Length > 1 ? parts[1] : parts[0];
                 var alias = _schema.GetAlias(entity);
@@ -101,62 +123,87 @@ public class QueryBinder
             }
         }
 
-        // 7. ORDER BY — tipo discriminado
-        if (intent.OrderBy is not null)
+        // 6. ORDER BY
+        if (intent.OrderBy != null)
         {
-            switch (intent.OrderBy)
+            if (intent.OrderBy is FieldOrderBy fo)
             {
-                case FieldOrderBy fo:
-                    var foAlias = _schema.GetAlias(fo.EntityLogical);
-                    var foField = _schema.ResolvePhysicalField(fo.EntityLogical, fo.FieldLogical);
-                    if (intent.OrderDescending) query.OrderByDesc($"{foAlias}.{foField}");
-                    else query.OrderBy($"{foAlias}.{foField}");
-                    break;
-
-                case MetricOrderBy mo:
-                    if (intent.OrderDescending) query.OrderByRaw($"{mo.MetricLogical} DESC");
-                    else query.OrderByRaw($"{mo.MetricLogical} ASC");
-                    break;
+                var alias = _schema.GetAlias(fo.EntityLogical);
+                var physical = _schema.ResolvePhysicalField(fo.EntityLogical, fo.FieldLogical);
+                if (intent.OrderDescending) query.OrderByDesc($"{alias}.{physical}");
+                else query.OrderBy($"{alias}.{physical}");
+            }
+            else if (intent.OrderBy is MetricOrderBy mo)
+            {
+                if (intent.OrderDescending) query.OrderByRaw($"{mo.MetricLogical} DESC");
+                else query.OrderByRaw($"{mo.MetricLogical} ASC");
             }
         }
 
-        // 8. TOP
-        if (intent.Top.HasValue)
-            query.Limit(intent.Top.Value);
+        // 7. LIMIT (TOP)
+        if (intent.Top.HasValue) query.Limit(intent.Top.Value);
 
-        // 9. Compilar y parchear SqlKata 4.x
-        var result = _compiler.Compile(query);
-        return ApplySqlServerFixes(result, intent);
-    }
+        // Compilación base
+        var compiled = _compiler.Compile(query);
 
-    /// <summary>
-    /// SqlKata 4.x genera OFFSET/FETCH con un ORDER BY (SELECT 0) espurio
-    /// cuando hay GROUP BY + Limit sin un ORDER BY real.
-    /// Este método lo reemplaza por SELECT TOP N.
-    /// </summary>
-    private static SqlResult ApplySqlServerFixes(SqlResult result, QueryModel intent)
-    {
-        if (!intent.Top.HasValue || intent.OrderBy is not null)
-            return result;
+        // 8. Aplicar parches críticos para SQL Server y retornar
+        var result = ApplySqlServerFixes(compiled, intent, _logger);
 
-        var sql = result.Sql;
-        var offsetIdx = sql.IndexOf("ORDER BY (SELECT 0)", StringComparison.OrdinalIgnoreCase);
+        // Verificación final de seguridad
+        if (string.IsNullOrWhiteSpace(result.Sql))
+        {
+            _logger?.LogError("ERROR: El SQL resultó vacío tras los parches.");
+            return compiled;
+        }
 
-        if (offsetIdx < 0)
-            return result;
-
-        // Quitar ORDER BY espurio + OFFSET/FETCH
-        sql = sql[..offsetIdx].TrimEnd();
-
-        // Inyectar TOP N después del SELECT
-        sql = sql.Replace("SELECT ", $"SELECT TOP {intent.Top.Value} ",
-            StringComparison.OrdinalIgnoreCase);
-
-        // Quitar bindings de OFFSET/FETCH que ya no aplican
-        result.Sql = sql;
-        result.NamedBindings.Remove("p0");
-        result.NamedBindings.Remove("p1");
+        _logger?.LogDebug("═══ QueryBinder.Bind() FIN ═══");
 
         return result;
+    }
+
+    private static SqlResult ApplySqlServerFixes(SqlResult compiled, QueryModel intent, ILogger? logger)
+    {
+        if (compiled == null || string.IsNullOrWhiteSpace(compiled.Sql)) return compiled!;
+
+        string sql = compiled.Sql;
+
+        // Si no hay TOP, retornamos el original
+        if (!intent.Top.HasValue) return compiled;
+
+        try
+        {
+            // 1. Quitar OFFSET/FETCH (SqlKata lo agrega al usar Limit con OrderBy)
+            // Mejoramos el Regex para que capture incluso si hay parámetros (@p0)
+            sql = Regex.Replace(sql, @"\s+OFFSET\s+.*$", "", RegexOptions.IgnoreCase | RegexOptions.Singleline).Trim();
+
+            // 2. Quitar el ordenamiento dummy
+            sql = sql.Replace("ORDER BY (SELECT 0)", "", StringComparison.OrdinalIgnoreCase).Trim();
+
+            // 3. Inyectar TOP(N)
+            if (!sql.Contains("SELECT TOP", StringComparison.OrdinalIgnoreCase))
+            {
+                var topValue = $"TOP ({intent.Top.Value}) ";
+                if (sql.Contains("SELECT DISTINCT", StringComparison.OrdinalIgnoreCase))
+                {
+                    sql = Regex.Replace(sql, "DISTINCT", $"DISTINCT {topValue}", RegexOptions.IgnoreCase);
+                }
+                else
+                {
+                    sql = Regex.Replace(sql, "SELECT", $"SELECT {topValue}", RegexOptions.IgnoreCase);
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(sql) || sql.Length < 10) return compiled;
+
+            var result = new SqlResult(sql, "@");
+            foreach (var b in compiled.NamedBindings) result.NamedBindings[b.Key] = b.Value;
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            logger?.LogWarning("ApplySqlServerFixes falló: {0}. Retornando SQL original.", ex.Message);
+            return compiled;
+        }
     }
 }

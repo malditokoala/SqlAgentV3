@@ -17,7 +17,6 @@ using SqlAgent.Infrastructure.Services;
 const string northwindCn = "Server=localhost,1433;Database=Northwind;User Id=sa;Password=Chopsuey00;TrustServerCertificate=True;";
 //"Server=MEXIT1041\\MEXIT1041;Database=Northwind;" +
 //"Integrated Security=True;TrustServerCertificate=True;";
-
 Console.WriteLine("Iniciando Agente SQL v3.0...\n");
 
 // 1. Configuración de Servicios (Inyección de Dependencias)
@@ -46,11 +45,10 @@ var executor = scope.ServiceProvider.GetRequiredService<QueryExecutor>();
 var pipeline = new SqlAgentPipeline(profile, profile, executor, logger);
 
 // 4. TEST DE INTELIGENCIA: Pedimos campos de dos tablas SIN declarar el JOIN
-// El JoinPlanner debe encontrar el camino entre 'Order' y 'OrderDetail' automáticamente.
 var intent = new QueryModel(
     EntityLogical: "Order",
     FieldsLogical: new List<string> { "OrderDate", "OrderDetail.Quantity" },
-    JoinsLogical: null,  // <--- ¡Dejamos que el motor lo resuelva solo!
+    JoinsLogical: null,  // <--- El motor lo resolverá solo
     Filters: null,
     GroupByLogical: null,
     OrderBy: new FieldOrderBy("Order", "OrderDate"),
@@ -69,7 +67,8 @@ try
     {
         var fecha = row.TryGetValue("OrderDate", out var d) ? d?.ToString() : "N/A";
         var cant = row.TryGetValue("Quantity", out var q) ? q?.ToString() : "N/A";
-        Console.WriteLine($"Fecha: {fecha} | Cantidad: {cant}");
+        var rev = row.TryGetValue("Revenue", out var r) ? r?.ToString() : "0";
+        Console.WriteLine($"Fecha: {fecha} | Cantidad: {cant} | Rev: {rev}");
     }
 
     Console.WriteLine("\n--- SQL GENERADO ---");
@@ -81,6 +80,7 @@ try
 catch (Exception ex)
 {
     Console.WriteLine($"\n[ERROR] {ex.Message}");
+    if (ex.InnerException != null) Console.WriteLine($"Detalle: {ex.InnerException.Message}");
 }
 
 Console.WriteLine("\nPresiona una tecla para salir...");
