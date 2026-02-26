@@ -16,9 +16,12 @@ public interface ISchemaProvider
 
 public interface IRelationshipResolver
 {
-    string BuildJoinCondition(string fromLogical, string toLogical); // construye el ON físico
+    string BuildJoinCondition(string fromLogical, string toLogical);
     bool RelationshipExists(string fromLogical, string toLogical);
+    IReadOnlyList<RelationshipEdge> GetAvailableEdges(); // ← nuevo
 }
+
+public record RelationshipEdge(string Source, string Target);
 
 public interface ICatalogRepository
 {
