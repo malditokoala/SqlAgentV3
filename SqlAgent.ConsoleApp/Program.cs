@@ -1,4 +1,7 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using SqlAgent.Domain.Interfaces;
@@ -7,9 +10,6 @@ using SqlAgent.Infrastructure.Data;
 using SqlAgent.Infrastructure.Engine;
 using SqlAgent.Infrastructure.Repositories;
 using SqlAgent.Infrastructure.Services;
-using Microsoft.Extensions.Logging;
-using System.Runtime.InteropServices;
-
 
 namespace SqlAgent.ConsoleApp;
 
@@ -52,12 +52,12 @@ class Program
         var pipeline = new SqlAgentPipeline(schema, schema, executor, logger);
 
         // 5. QueryModel correcto para el test
-        // MetricLogical debe tener valor para que CardinalityGuard actúe
         var intent = new QueryModel(
             EntityLogical: "Order",
             FieldsLogical: new List<string> { "OrderDate" },
             Filters: null,
-            JoinsLogical: new List<JoinModel> { new("OrderDetail") }, // solo ToEntityLogical
+            // CORREGIDO: JoinModel se instancia solo con el destino (ToEntityLogical) según tu dominio local
+            JoinsLogical: new List<JoinModel> { new JoinModel("OrderDetail") },
             GroupByLogical: new List<string> { "OrderDate" },
             OrderBy: null,
             OrderDescending: false,
@@ -73,7 +73,6 @@ class Program
             Console.WriteLine("--- DATOS ---");
             foreach (var row in result.Data)
             {
-                var test = row;
                 var orderDate = row.TryGetValue("OrderDate", out var od) ? od?.ToString() ?? "?" : "?";
                 var orderId = row.TryGetValue("OrderId", out var oi) ? oi?.ToString() ?? "No inyectado" : "No inyectado";
                 Console.WriteLine($"Fecha: {orderDate} | Grain (OrderId): {orderId}");

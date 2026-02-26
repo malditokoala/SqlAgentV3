@@ -1,4 +1,7 @@
-﻿using SqlAgent.Domain.Models;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using SqlAgent.Domain.Models;
 using SqlAgent.Domain.Interfaces;
 using SqlAgent.Domain.Exceptions;
 
@@ -49,13 +52,23 @@ public class CardinalityGuard
         }
 
         var newGroupBy = new List<string>(query.GroupByLogical ?? []);
+        var newFields = new List<string>(query.FieldsLogical ?? []); // <-- FIX: Lista para el SELECT
 
         foreach (var grainField in requiredGrainFields)
         {
             if (!newGroupBy.Contains(grainField, StringComparer.OrdinalIgnoreCase))
                 newGroupBy.Add(grainField);
+
+            // FIX: Inyectar en el SELECT (FieldsLogical) para que Dapper lo pueda leer
+            if (!newFields.Contains(grainField, StringComparer.OrdinalIgnoreCase))
+                newFields.Add(grainField);
         }
 
-        return query with { GroupByLogical = newGroupBy };
+        // FIX: Retornamos el query mutado con AMBAS listas actualizadas
+        return query with
+        {
+            GroupByLogical = newGroupBy,
+            FieldsLogical = newFields
+        };
     }
 }
